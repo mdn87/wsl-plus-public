@@ -1,0 +1,9 @@
+# Deprecated compatibility view. Runtime checks materialize exact targets from
+# contracts/v1/effects.tsv instead of consuming this file.
+/etc/example-site/agent-settings.json
+/etc/example-site/attest.json
+/etc/example-site/agent-lanes.json
+/var/lib/example-site/config-overlay.json
+/opt/example-site/bin/example-agent
+/usr/local/bin/example-attest
+/usr/local/bin/example-attest-admin

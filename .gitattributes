@@ -1,0 +1,5 @@
+# Shell scripts and package data must reach WSL with LF endings regardless of a
+# contributor's core.autocrlf setting. A stray CR breaks the shebang line and
+# every here-document in the installer.
+* text=auto eol=lf
+*.ps1 text eol=crlf

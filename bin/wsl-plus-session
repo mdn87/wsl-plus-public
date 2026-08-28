@@ -1,0 +1,277 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+root=${WSL_PLUS_ROOT:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)}
+runtime_file=${WSL_PLUS_RUNTIME:-$HOME/.config/wsl-plus/runtime.conf}
+sesh_config=${WSL_PLUS_SESH_CONFIG:-$root/core/session/sesh.toml}
+resurrect_root=${WSL_PLUS_RESURRECT_ROOT:-$HOME/.tmux/plugins/tmux-resurrect}
+
+die() {
+  printf 'wsl-plus session: %s\n' "$*" >&2
+  exit 1
+}
+
+command_exists() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+command_status() {
+  if command_exists "$1"; then
+    printf 'available'
+  else
+    printf 'missing'
+  fi
+}
+
+runtime_value() {
+  local key=$1
+  [[ -r $runtime_file ]] || return 1
+  awk -F= -v key="$key" '$1 == key { print substr($0, index($0, "=") + 1); found=1; exit } END { if (!found) exit 1 }' "$runtime_file"
+}
+
+require_enabled() {
+  local enabled schema policy legacy
+  schema=$(runtime_value WSL_PLUS_SCHEMA_VERSION 2>/dev/null || printf '1')
+  enabled=$(runtime_value WSL_PLUS_ENABLE_LOCAL_SESSIONS 2>/dev/null || true)
+  if [[ -z $enabled && $schema == 1 ]]; then
+    policy=$(runtime_value WSL_PLUS_POLICY 2>/dev/null || true)
+    legacy=$(runtime_value WSL_PLUS_ENABLE_HOME_SESSIONS 2>/dev/null || true)
+    [[ $policy == home && $legacy == 1 ]] && enabled=1
+  fi
+  [[ $enabled == 1 ]] || die 'Local session navigation is disabled by the active defaults.'
+}
+
+session_backend() {
+  local backend schema policy
+  backend=$(runtime_value WSL_PLUS_SESSION_BACKEND 2>/dev/null || true)
+  if [[ -z $backend ]]; then
+    schema=$(runtime_value WSL_PLUS_SCHEMA_VERSION 2>/dev/null || printf '1')
+    policy=$(runtime_value WSL_PLUS_POLICY 2>/dev/null || true)
+    if [[ $schema == 1 && $policy == home ]]; then backend=auto; else backend=native; fi
+  fi
+  case $backend in
+    auto|native) printf '%s' "$backend" ;;
+    *) die "Unsupported session backend: $backend" ;;
+  esac
+}
+
+external_adapters_enabled() {
+  [[ $(session_backend) == auto ]]
+}
+
+safe_sesh() {
+  command sesh --config "$sesh_config" "$@"
+}
+
+sanitize_session_name() {
+  local value=$1
+  value=${value// /_}
+  value=${value//./_}
+  value=${value//:/_}
+  value=$(printf '%s' "$value" | tr -cd '[:alnum:]_-')
+  [[ -n $value ]] || value=session
+  printf '%.80s' "$value"
+}
+
+session_name_for_dir() {
+  local directory=$1 root_dir name
+  root_dir=$(git -C "$directory" rev-parse --show-toplevel 2>/dev/null || true)
+  if [[ -n $root_dir ]]; then
+    name=$(basename -- "$root_dir")
+  else
+    name=$(basename -- "$directory")
+  fi
+  sanitize_session_name "$name"
+}
+
+connect_tmux_session() {
+  local name=$1 directory=${2:-$HOME}
+  command_exists tmux || die 'tmux is required for session navigation.'
+
+  if tmux has-session -t "=$name" 2>/dev/null; then
+    if [[ -n ${TMUX-} ]]; then
+      exec tmux switch-client -t "=$name"
+    else
+      exec tmux attach-session -t "=$name"
+    fi
+  fi
+
+  [[ -d $directory ]] || die "Directory does not exist: $directory"
+  if [[ -n ${TMUX-} ]]; then
+    tmux new-session -d -s "$name" -c "$directory"
+    exec tmux switch-client -t "=$name"
+  else
+    exec tmux new-session -s "$name" -c "$directory"
+  fi
+}
+
+connect_directory() {
+  local directory name
+  directory=$(cd -- "$1" 2>/dev/null && pwd -P) || die "Directory does not exist: $1"
+  name=$(session_name_for_dir "$directory")
+  connect_tmux_session "$name" "$directory"
+}
+
+native_list() {
+  local directory
+
+  if command_exists tmux; then
+    tmux list-sessions -F $'tmux\t#{session_name}\t#{session_path}' 2>/dev/null || true
+  fi
+
+  if command_exists zoxide; then
+    while IFS= read -r directory || [[ -n $directory ]]; do
+      [[ -d $directory ]] || continue
+      printf 'dir\t%s\t%s\n' "$(basename -- "$directory")" "$directory"
+    done < <(zoxide query -l 2>/dev/null || true)
+  fi
+}
+
+native_pick() {
+  local selection kind label target
+  command_exists tmux || die 'tmux is required for the native session picker.'
+  if ! command_exists fzf; then
+    if external_adapters_enabled; then
+      die 'fzf is required for the native picker; Home may alternatively use an installed Sesh adapter.'
+    fi
+    die 'fzf is required for the native session picker.'
+  fi
+
+  selection=$(native_list | awk -F '\t' '!seen[$1 FS $2 FS $3]++' | \
+    fzf --delimiter=$'\t' --with-nth=1,2,3 --no-sort --prompt='WSL session> ') || return 0
+  [[ -n $selection ]] || return 0
+
+  IFS=$'\t' read -r kind label target <<< "$selection"
+  case $kind in
+    tmux) connect_tmux_session "$label" "$target" ;;
+    dir) connect_directory "$target" ;;
+    *) die 'The selected session entry is malformed.' ;;
+  esac
+}
+
+open_target() {
+  local target=$1
+  [[ -n $target ]] || die 'open requires a tmux session name or directory.'
+
+  if [[ -d $target ]]; then
+    connect_directory "$target"
+  fi
+
+  if command_exists tmux && tmux has-session -t "=$target" 2>/dev/null; then
+    connect_tmux_session "$target"
+  fi
+
+  if external_adapters_enabled && command_exists sesh; then
+    exec sesh --config "$sesh_config" connect "$target"
+  fi
+
+  die "No tmux session or directory matched: $target"
+}
+
+resurrect_script() {
+  local action=$1 script
+  external_adapters_enabled || die "$action is unavailable with the native session backend."
+  case $action in
+    save) script="$resurrect_root/scripts/save.sh" ;;
+    restore) script="$resurrect_root/scripts/restore.sh" ;;
+    *) return 2 ;;
+  esac
+  [[ -r $script ]] || die "tmux-resurrect is not installed at $resurrect_root"
+  exec bash "$script"
+}
+
+print_status() {
+  local backend resurrect selected_backend
+  selected_backend=$(session_backend)
+  if [[ $selected_backend == auto ]] && command_exists sesh; then
+    backend='Sesh with WSL Plus safe config'
+  else
+    backend='native tmux/zoxide/fzf chooser'
+  fi
+  if [[ $selected_backend == native ]]; then
+    resurrect='disabled by selected backend'
+  elif [[ -r $resurrect_root/resurrect.tmux ]]; then
+    resurrect='available, manual save/restore only'
+  else
+    resurrect='not installed'
+  fi
+
+  printf 'Local sessions: enabled\n'
+  printf 'Selected backend: %s\n' "$selected_backend"
+  printf 'Backend: %s\n' "$backend"
+  printf 'tmux: %s\n' "$(command_status tmux)"
+  printf 'fzf: %s\n' "$(command_status fzf)"
+  printf 'zoxide: %s\n' "$(command_status zoxide)"
+  printf 'sesh: %s\n' "$(command_status sesh)"
+  printf 'tmux-resurrect: %s\n' "$resurrect"
+  printf 'Automatic process restoration: disabled\n'
+}
+
+usage() {
+  cat <<'HELP'
+usage: wsl-plus session [COMMAND] [TARGET]
+
+Commands:
+  pick                 Open the preferred interactive chooser. This is default.
+  list                 List discoverable sessions and directories.
+  attach NAME          Attach to an existing tmux session.
+  create DIRECTORY     Create or attach to the directory-named tmux session.
+  open TARGET          Compatibility alias: attach by name or create by path.
+  last                 Switch to the previously used tmux session.
+  save                 Manually save a tmux layout with tmux-resurrect.
+  restore              Manually restore a tmux layout with tmux-resurrect.
+  status               Show available session backends and safety settings.
+
+WSL Plus may passively name an existing repository. It never clones, creates,
+or mutates repositories or worktrees, launches project commands or agents, or
+automatically restores processes through this command.
+HELP
+}
+
+require_enabled
+command_name=${1:-pick}
+shift || true
+
+case $command_name in
+  pick)
+    if external_adapters_enabled && command_exists sesh; then
+      exec sesh --config "$sesh_config" picker
+    fi
+    native_pick
+    ;;
+  list)
+    if external_adapters_enabled && command_exists sesh; then safe_sesh list; else native_list; fi
+    ;;
+  attach)
+    [[ $# -eq 1 ]] || die 'attach requires exactly one tmux session name.'
+    command_exists tmux || die 'tmux is required for session navigation.'
+    tmux has-session -t "=$1" 2>/dev/null || die "No tmux session matched: $1"
+    connect_tmux_session "$1"
+    ;;
+  create)
+    [[ $# -eq 1 ]] || die 'create requires exactly one existing directory.'
+    [[ -d $1 ]] || die "Directory does not exist: $1"
+    connect_directory "$1"
+    ;;
+  open|connect)
+    [[ $# -eq 1 ]] || die "$command_name requires exactly one target."
+    open_target "$1"
+    ;;
+  last)
+    if external_adapters_enabled && command_exists sesh; then exec sesh --config "$sesh_config" last; fi
+    [[ -n ${TMUX-} ]] || die 'last requires an attached tmux client when Sesh is unavailable.'
+    exec tmux switch-client -l
+    ;;
+  save|restore)
+    resurrect_script "$command_name"
+    ;;
+  status)
+    print_status
+    ;;
+  help|--help|-h)
+    usage
+    ;;
+  *)
+    die "Unknown session command: $command_name"
+    ;;
+esac

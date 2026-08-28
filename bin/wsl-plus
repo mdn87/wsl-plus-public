@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+root=${WSL_PLUS_ROOT:-$HOME/.local/share/wsl-plus/current}
+command_name=${1:-status}
+shift || true
+
+case $command_name in
+  status|doctor)
+    exec "$root/doctor.sh" "$@"
+    ;;
+  session|sessions)
+    exec "$root/bin/wsl-plus-session" "$@"
+    ;;
+  ssh-agent)
+    exec "$root/bin/wsl-plus-ssh-agent" "$@"
+    ;;
+  rollback|uninstall)
+    exec "$root/rollback.sh" "$@"
+    ;;
+  reinstall|update)
+    exec "$root/install.sh" "$@"
+    ;;
+  version|--version|-V)
+    cat "$root/VERSION"
+    ;;
+  help|--help|-h)
+    cat <<'HELP'
+usage: wsl-plus COMMAND [OPTIONS]
+
+Commands:
+  status, doctor   Validate the active installation and policy boundary.
+  session          Navigate bounded local tmux sessions.
+  ssh-agent        Configure the opt-in Windows SSH-agent adapter.
+  reinstall        Re-run the packaged installer.
+  rollback         Remove managed shell blocks and user-level files.
+  version          Print the installed version.
+HELP
+    ;;
+  *)
+    printf 'Unknown command: %s\n' "$command_name" >&2
+    exit 2
+    ;;
+esac

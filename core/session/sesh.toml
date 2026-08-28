@@ -1,0 +1,3 @@
+# WSL Plus intentionally defines no Sesh startup commands, aliases, clone roots,
+# or worktree behavior. This private config gives the Home auto backend a
+# predictable discovery-only baseline when an external sesh binary is present.

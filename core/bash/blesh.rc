@@ -1,0 +1,21 @@
+# shellcheck shell=bash
+
+# Show suggestions while the operator types, including matches from local Bash
+# history. Right Arrow, Ctrl-F, or End accepts the visible suggestion.
+bleopt complete_auto_complete=1
+if bleopt complete_auto_complete_opts >/dev/null 2>&1; then
+  bleopt complete_auto_complete_opts-=history-disabled
+else
+  bleopt complete_auto_history=1
+fi
+bleopt complete_auto_delay=100
+
+# Keep the existing shell prompt visually unchanged.
+bleopt prompt_eol_mark=''
+bleopt exec_errexit_mark=
+bleopt exec_elapsed_mark=
+
+# Keep suggestions readable without a bright background, and show syntax
+# errors in light gray instead of ble.sh's default red warning face.
+ble-face -s auto_complete 'fg=252,bg=238'
+ble-face -s syntax_error 'fg=250'

@@ -1,0 +1,164 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+root=${WSL_PLUS_ROOT:-$HOME/.local/share/wsl-plus/current}
+# shellcheck source=lib/common.sh
+. "$root/lib/common.sh"
+# shellcheck source=lib/config.sh
+. "$root/lib/config.sh"
+
+runtime_file=${WSL_PLUS_RUNTIME:-$HOME/.config/wsl-plus/runtime.conf}
+config_dir=$HOME/.config/wsl-plus
+config_file=$config_dir/ssh-agent.conf
+state_dir=$HOME/.local/state/wsl-plus/ssh-agent
+socket_path=$state_dir/agent.sock
+pid_file=$state_dir/relay.pid
+wrapper_file=$state_dir/relay.sh
+log_file=$state_dir/relay.log
+
+usage() {
+  cat <<'HELP'
+usage: wsl-plus ssh-agent COMMAND [OPTIONS]
+
+Commands:
+  configure --relay ABSOLUTE_PATH  Select one existing npiperelay.exe.
+  start                            Start only the WSL Unix-socket relay.
+  stop                             Stop the managed relay.
+  status                           Report configuration and live probe state.
+
+The adapter never downloads a relay, starts the Windows ssh-agent service, or
+loads keys. It requires the shared-agent, Windows-interop, and cross-filesystem
+capabilities.
+HELP
+}
+
+declare -A RUNTIME=()
+load_kv_config "$runtime_file" RUNTIME || die 'SSH-agent adapter requires a valid WSL Plus runtime.'
+if [[ ${RUNTIME[WSL_PLUS_ALLOW_SHARED_SSH_AGENT]-0} != 1 \
+  || ${RUNTIME[WSL_PLUS_ALLOW_WINDOWS_INTEROP]-0} != 1 \
+  || ${RUNTIME[WSL_PLUS_ALLOW_CROSS_FILESYSTEM]-0} != 1 ]]; then
+  die 'The Windows SSH-agent adapter requires shared-agent, Windows-interop, and cross-filesystem capabilities.'
+fi
+
+load_adapter_config() {
+  declare -gA SSH_AGENT_CONFIG=()
+  load_kv_config "$config_file" SSH_AGENT_CONFIG || die 'SSH-agent adapter is not configured.'
+  config_require_keys SSH_AGENT_CONFIG SCHEMA RELAY_PATH || die 'SSH-agent adapter configuration is incomplete.'
+  [[ ${SSH_AGENT_CONFIG[SCHEMA]} == 1 ]] || die 'SSH-agent adapter configuration schema is unsupported.'
+}
+
+relay_pid() {
+  local pid=
+  [[ -r $pid_file ]] || return 1
+  IFS= read -r pid < "$pid_file"
+  [[ $pid =~ ^[1-9][0-9]*$ ]] || return 1
+  [[ -r /proc/$pid/cmdline ]] || return 1
+  tr '\0' ' ' < "/proc/$pid/cmdline" | grep -Fq -- "UNIX-LISTEN:$socket_path" || return 1
+  printf '%s' "$pid"
+}
+
+probe_agent() {
+  local result
+  [[ -S $socket_path ]] || return 1
+  set +e
+  SSH_AUTH_SOCK=$socket_path timeout 2 ssh-add -l >/dev/null 2>&1
+  result=$?
+  set -e
+  [[ $result == 0 || $result == 1 ]]
+}
+
+stop_relay() {
+  local pid
+  if pid=$(relay_pid); then
+    kill "$pid" 2>/dev/null || true
+    for _ in {1..20}; do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.1
+    done
+  fi
+  rm -f -- "$pid_file" "$socket_path" "$wrapper_file"
+}
+
+command_name=${1:-status}
+shift || true
+case $command_name in
+  configure)
+    relay=
+    while (($#)); do
+      case $1 in
+        --relay)
+          (($# >= 2)) || die '--relay requires an absolute path.'
+          relay=$2
+          shift 2
+          ;;
+        *) die "Unknown configure option: $1" ;;
+      esac
+    done
+    [[ $relay != *$'\n'* && $relay != *$'\r'* ]] || die 'Relay path must not contain a newline.'
+    relay=$(canonicalize_lexical_path "$relay")
+    [[ $relay == /* && ${relay##*/} == npiperelay.exe ]] || die 'Relay must be an absolute path ending in npiperelay.exe.'
+    [[ $relay == /mnt/[a-zA-Z]/* ]] || die 'Relay must be an explicitly selected Windows path beneath /mnt/<drive>.'
+    [[ -f $relay && -x $relay ]] || die "Relay is not executable: $relay"
+    mkdir -p "$config_dir"
+    chmod 0700 "$config_dir"
+    config_tmp=$(mktemp "$config_dir/ssh-agent.conf.XXXXXX")
+    printf 'SCHEMA=1\nRELAY_PATH=%s\n' "$relay" > "$config_tmp"
+    chmod 0600 "$config_tmp"
+    mv -- "$config_tmp" "$config_file"
+    printf 'Configured Windows SSH-agent relay: %s\n' "$relay"
+    ;;
+  start)
+    (($# == 0)) || die 'start accepts no options.'
+    load_adapter_config
+    command_exists socat || die 'socat is required but was not found.'
+    command_exists setsid || die 'setsid is required but was not found.'
+    command_exists timeout || die 'timeout is required but was not found.'
+    command_exists ssh-add || die 'ssh-add is required but was not found.'
+    if relay_pid >/dev/null && probe_agent; then
+      printf 'Windows SSH-agent relay is already active.\n'
+      exit 0
+    fi
+    stop_relay
+    mkdir -p "$state_dir"
+    chmod 0700 "$state_dir"
+    printf '#!/usr/bin/env bash\nexec %q -ei -s //./pipe/openssh-ssh-agent\n' "${SSH_AGENT_CONFIG[RELAY_PATH]}" > "$wrapper_file"
+    chmod 0700 "$wrapper_file"
+    setsid socat "UNIX-LISTEN:$socket_path,fork,mode=600" "EXEC:$wrapper_file,nofork" </dev/null >"$log_file" 2>&1 &
+    relay_process=$!
+    printf '%s\n' "$relay_process" > "$pid_file"
+    chmod 0600 "$pid_file" "$log_file"
+    for _ in {1..20}; do
+      [[ -S $socket_path ]] && break
+      kill -0 "$relay_process" 2>/dev/null || break
+      sleep 0.1
+    done
+    if ! relay_pid >/dev/null || ! probe_agent; then
+      stop_relay
+      die 'The selected Windows OpenSSH agent did not pass the bounded probe.'
+    fi
+    printf 'Windows SSH-agent relay is active at %s\n' "$socket_path"
+    ;;
+  stop)
+    (($# == 0)) || die 'stop accepts no options.'
+    stop_relay
+    printf 'Windows SSH-agent relay is stopped.\n'
+    ;;
+  status)
+    (($# == 0)) || die 'status accepts no options.'
+    if [[ ! -r $config_file ]]; then
+      printf 'Windows SSH-agent adapter: not configured\n'
+      exit 0
+    fi
+    load_adapter_config
+    printf 'Windows SSH-agent adapter: configured\n'
+    printf 'Relay: %s\n' "${SSH_AGENT_CONFIG[RELAY_PATH]}"
+    if relay_pid >/dev/null && probe_agent; then
+      printf 'State: active\n'
+      printf 'Socket: %s\n' "$socket_path"
+    else
+      printf 'State: inactive\n'
+    fi
+    ;;
+  help|--help|-h) usage ;;
+  *) die "Unknown SSH-agent command: $command_name" ;;
+esac

@@ -1,0 +1,13 @@
+bash-completion
+bat
+ca-certificates
+curl
+fd-find
+fzf
+git
+jq
+less
+ripgrep
+shellcheck
+tmux
+unzip

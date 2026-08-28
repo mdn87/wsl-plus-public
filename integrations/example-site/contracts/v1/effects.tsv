@@ -1,0 +1,11 @@
+FILE_NO_WRITE	/etc/example-site/agent-settings.json
+FILE_NO_WRITE	/etc/example-site/attest.json
+FILE_NO_WRITE	/etc/example-site/agent-lanes.json
+FILE_NO_WRITE	/var/lib/example-site/config-overlay.json
+FILE_NO_WRITE	/opt/example-site/bin/example-agent
+FILE_NO_WRITE	/usr/local/bin/example-attest
+FILE_NO_WRITE	/usr/local/bin/example-attest-admin
+AUTHORIZATION_LANE_NO_CHANGE	/etc/example-site/agent-lanes.json
+COMMAND_RESOLUTION_NO_CHANGE	example-agent
+COMMAND_RESOLUTION_NO_CHANGE	example-attest
+COMMAND_RESOLUTION_NO_CHANGE	example-attest-admin

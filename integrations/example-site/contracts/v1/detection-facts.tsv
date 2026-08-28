@@ -1,0 +1,4 @@
+ROOT_REGULAR_FILE	/etc/example-site/agent-settings.json
+ROOT_REGULAR_FILE	/etc/example-site/attest.json
+ROOT_EXECUTABLE	/opt/example-site/bin/example-agent
+ROOT_EXECUTABLE	/usr/local/bin/example-attest

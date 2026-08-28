@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ShellCheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+
+      - name: Check Bash syntax
+        run: |
+          find . -type f \( -name '*.sh' -o -name '*.bash' \) -print0 \
+            | xargs -0 -n1 bash -n
+
+      - name: Run ShellCheck
+        run: |
+          shellcheck -x \
+            install.sh doctor.sh rollback.sh \
+            bin/wsl-plus bin/wsl-plus-session bin/wsl-plus-ssh-agent \
+            lib/*.sh core/bash/*.bash tests/run.sh
+
+      - name: Parse PowerShell bootstrap
+        shell: pwsh
+        run: |
+          [void][scriptblock]::Create((Get-Content -Raw ./bootstrap.ps1))
+
+      - name: Run installer tests
+        run: ./tests/run.sh
